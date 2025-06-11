@@ -73,5 +73,9 @@ async def get_hubspot_credentials_integration(user_id: str = Form(...), org_id: 
     return await get_hubspot_credentials(user_id, org_id)
 
 @app.post('/integrations/hubspot/load')
-async def load_hubspot_data_integration(credentials: str = Form(...)):
-    return await get_items_hubspot(credentials)
+async def load_hubspot_data_integration(
+    credentials: str = Form(...),
+    after: str = Form(None),
+    limit: int = Form(20)
+):
+    return await get_items_hubspot(credentials, after, limit)

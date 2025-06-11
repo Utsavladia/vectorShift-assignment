@@ -8,7 +8,7 @@ import {
 } from '@mui/material';
 import axios from 'axios';
 
-export const HubspotIntegration = ({ user, org, integrationParams, setIntegrationParams }) => {
+export const HubspotIntegration = ({ user, org, integrationParams, setIntegrationParams, onIntegrationComplete }) => {
     const [isConnected, setIsConnected] = useState(false);
     const [isConnecting, setIsConnecting] = useState(false);
 
@@ -49,6 +49,7 @@ export const HubspotIntegration = ({ user, org, integrationParams, setIntegratio
                 setIsConnecting(false);
                 setIsConnected(true);
                 setIntegrationParams(prev => ({ ...prev, credentials: credentials, type: 'HubSpot' }));
+                onIntegrationComplete?.();
             }
             setIsConnecting(false);
         } catch (e) {

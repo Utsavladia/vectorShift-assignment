@@ -8,31 +8,27 @@ from fastapi.responses import HTMLResponse
 import httpx
 import asyncio
 import base64
-import hashlib
-import time
+import logging
 
-import requests
 from integrations.integration_item import IntegrationItem
-
 from redis_client import add_key_value_redis, get_value_redis, delete_key_redis
 
-# You'll need to replace these with your HubSpot app credentials
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# HubSpot OAuth2 configuration
 CLIENT_ID = 'e44bde63-5e9e-4f39-9400-2887edf5b2c6'
 CLIENT_SECRET = '61d10672-160a-4efd-af71-d127c71637f0'
 REDIRECT_URI = 'http://localhost:8000/integrations/hubspot/oauth2callback'
-
-# HubSpot OAuth2 endpoints
 AUTHORIZATION_URL = 'https://app.hubspot.com/oauth/authorize'
-TOKEN_URL = 'https://api.hubspot.com/oauth/v1/token'
+TOKEN_URL = 'https://api.hubapi.com/oauth/v1/token'
 
 # Required scopes for HubSpot
 SCOPES = [
     'crm.objects.contacts.read',
-    'crm.objects.contacts.write',
     'crm.objects.companies.read',
-    'crm.objects.companies.write',
-    'crm.objects.deals.read',
-    'crm.objects.deals.write'
+    'crm.objects.deals.read'
 ]
 
 async def authorize_hubspot(user_id, org_id):
@@ -42,13 +38,8 @@ async def authorize_hubspot(user_id, org_id):
         'org_id': org_id
     }
     encoded_state = base64.urlsafe_b64encode(json.dumps(state_data).encode('utf-8')).decode('utf-8')
-
-    # Build authorization URL
     auth_url = f'{AUTHORIZATION_URL}?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&scope={" ".join(SCOPES)}&state={encoded_state}'
-
-    # Store state in Redis
     await add_key_value_redis(f'hubspot_state:{org_id}:{user_id}', json.dumps(state_data), expire=600)
-
     return auth_url
 
 async def oauth2callback_hubspot(request: Request):
@@ -86,14 +77,7 @@ async def oauth2callback_hubspot(request: Request):
         await delete_key_redis(f'hubspot_state:{org_id}:{user_id}')
         await add_key_value_redis(f'hubspot_credentials:{org_id}:{user_id}', json.dumps(response.json()), expire=600)
 
-    close_window_script = """
-    <html>
-        <script>
-            window.close();
-        </script>
-    </html>
-    """
-    return HTMLResponse(content=close_window_script)
+    return HTMLResponse(content="<html><script>window.close();</script></html>")
 
 async def get_hubspot_credentials(user_id, org_id):
     credentials = await get_value_redis(f'hubspot_credentials:{org_id}:{user_id}')
@@ -101,13 +85,23 @@ async def get_hubspot_credentials(user_id, org_id):
         raise HTTPException(status_code=400, detail='No credentials found.')
     credentials = json.loads(credentials)
     await delete_key_redis(f'hubspot_credentials:{org_id}:{user_id}')
-
     return credentials
 
-def create_integration_item_metadata_object(response_json: dict, item_type: str, parent_id=None, parent_name=None) -> IntegrationItem:
+def create_integration_item_metadata_object(response_json: dict, item_type: str) -> IntegrationItem:
     """Creates an integration metadata object from the HubSpot response"""
     properties = response_json.get('properties', {})
-    name = properties.get('name') or properties.get('firstname') or properties.get('dealname') or 'Unnamed'
+    
+    # Handle different types of names based on item type
+    name = 'Unnamed'
+    if item_type == 'Contact':
+        firstname = properties.get('firstname', '')
+        lastname = properties.get('lastname', '')
+        email = properties.get('email', '')
+        name = f"{firstname} {lastname}".strip() or email or 'Unnamed Contact'
+    elif item_type == 'Company':
+        name = properties.get('name', 'Unnamed Company')
+    elif item_type == 'Deal':
+        name = properties.get('dealname', 'Unnamed Deal')
     
     # Convert string dates to datetime objects
     creation_time = None
@@ -124,125 +118,128 @@ def create_integration_item_metadata_object(response_json: dict, item_type: str,
         except:
             pass
     
-    integration_item_metadata = IntegrationItem(
+    return IntegrationItem(
         id=f"{response_json.get('id', '')}_{item_type}",
         name=name,
         type=item_type,
-        parent_id=parent_id,
-        parent_path_or_name=parent_name,
         creation_time=creation_time,
         last_modified_time=last_modified_time,
         url=f"https://app.hubspot.com/contacts/{response_json.get('id', '')}" if item_type == 'Contact' else None
     )
-    return integration_item_metadata
 
-async def get_items_hubspot(credentials) -> list[IntegrationItem]:
-    """Fetches and aggregates all metadata relevant for a HubSpot integration"""
-    print("Starting get_items_hubspot with credentials:", credentials)
+async def get_items_hubspot(credentials: str, after: str = None, limit: int = 5):
+    """Get items from HubSpot with pagination support."""
     credentials = json.loads(credentials)
     access_token = credentials.get('access_token')
     
     if not access_token:
-        print("No access token found in credentials")
         raise HTTPException(status_code=400, detail='Invalid access token')
     
-    print("Access token found:", access_token[:10] + "...")
-    
-    list_of_integration_item_metadata = []
     headers = {
         'Authorization': f'Bearer {access_token}',
         'Content-Type': 'application/json'
     }
     
-    # Function to handle pagination
-    def fetch_all_items(url, item_type, parent_id=None, parent_name=None):
-        items = []
-        after = 0
-        print(f"Fetching {item_type} from {url}")
-        while True:
-            try:
-                response = requests.get(
-                    f"{url}?limit=100&after={after}",
-                    headers=headers
-                )
-                
-                print(f"Response status for {item_type}:", response.status_code)
-                print(f"Response body for {item_type}:", response.text[:200])  # Print first 200 chars
+    # Parse the after token if it exists
+    after_tokens = {}
+    if after:
+        try:
+            after_tokens = json.loads(after)
+        except:
+            after_tokens = {}
+    
+    async def fetch_hubspot_items(url: str, item_type: str, after_token: str = None) -> dict:
+        try:
+            # Define properties to fetch based on item type
+            properties = ['createdate', 'hs_lastmodifieddate']
+            if item_type == 'Contact':
+                properties.extend(['firstname', 'lastname', 'email'])
+            elif item_type == 'Company':
+                properties.extend(['name'])
+            elif item_type == 'Deal':
+                properties.extend(['dealname'])
+
+            params = {
+                'limit': limit,
+                'properties': properties
+            }
+            if after_token:
+                params['after'] = after_token
+
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, params=params, headers=headers)
                 
                 if response.status_code == 429:  # Rate limit
                     retry_after = int(response.headers.get('Retry-After', 10))
-                    print(f"Rate limited, waiting {retry_after} seconds")
-                    time.sleep(retry_after)
-                    continue
-                    
+                    await asyncio.sleep(retry_after)
+                    return await fetch_hubspot_items(url, item_type, after_token)
+                
                 if response.status_code != 200:
-                    print(f"Error fetching {item_type}: {response.status_code} - {response.text}")
-                    break
-                    
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail=f'Failed to fetch {item_type} data'
+                    )
+                
                 data = response.json()
-                results = data.get('results', [])
-                print(f"Found {len(results)} {item_type} items")
+                items = [
+                    create_integration_item_metadata_object(item, item_type)
+                    for item in data.get('results', [])
+                ]
                 
-                for item in results:
-                    items.append(create_integration_item_metadata_object(
-                        item, 
-                        item_type,
-                        parent_id,
-                        parent_name
-                    ))
+                paging = data.get('paging', {})
+                next_after = paging.get('next', {}).get('after')
                 
-                if not data.get('paging', {}).get('next', {}).get('after'):
-                    break
-                    
-                after = data['paging']['next']['after']
+                return {
+                    'items': items,
+                    'next_after': next_after,
+                    'has_more': bool(next_after)
+                }
                 
-            except Exception as e:
-                print(f"Error processing {item_type}: {str(e)}")
-                break
-                
-        return items
+        except Exception as e:
+            logger.error(f"Error fetching {item_type}: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # Fetch data for each type
+    contacts_result = await fetch_hubspot_items(
+        'https://api.hubapi.com/crm/v3/objects/contacts',
+        'Contact',
+        after_tokens.get('contacts')
+    )
     
-    # Fetch contacts
-    print("Fetching contacts...")
-    contacts = fetch_all_items('https://api.hubapi.com/crm/v3/objects/contacts', 'Contact')
-    print(f"Found {len(contacts)} contacts")
-    list_of_integration_item_metadata.extend(contacts)
+    companies_result = await fetch_hubspot_items(
+        'https://api.hubapi.com/crm/v3/objects/companies',
+        'Company',
+        after_tokens.get('companies')
+    )
     
-    # Fetch companies
-    print("Fetching companies...")
-    companies = fetch_all_items('https://api.hubapi.com/crm/v3/objects/companies', 'Company')
-    print(f"Found {len(companies)} companies")
-    list_of_integration_item_metadata.extend(companies)
+    deals_result = await fetch_hubspot_items(
+        'https://api.hubapi.com/crm/v3/objects/deals',
+        'Deal',
+        after_tokens.get('deals')
+    )
     
-    # Fetch deals
-    print("Fetching deals...")
-    deals = fetch_all_items('https://api.hubapi.com/crm/v3/objects/deals', 'Deal')
-    print(f"Found {len(deals)} deals")
-    list_of_integration_item_metadata.extend(deals)
+    # Combine and sort all items
+    all_items = (
+        contacts_result['items'] +
+        companies_result['items'] +
+        deals_result['items']
+    )
+    all_items.sort(key=lambda x: x.creation_time if x.creation_time else datetime.min, reverse=True)
     
-    print(f'Total items found: {len(list_of_integration_item_metadata)}')
+    # Create new after tokens object
+    next_after_tokens = {
+        'contacts': contacts_result['next_after'],
+        'companies': companies_result['next_after'],
+        'deals': deals_result['next_after']
+    }
     
-    # Convert IntegrationItem objects to dictionaries
-    items_dict = []
-    for item in list_of_integration_item_metadata:
-        item_dict = {
-            'id': item.id,
-            'name': item.name,
-            'type': item.type,
-            'parent_id': item.parent_id,
-            'parent_path_or_name': item.parent_path_or_name,
-            'creation_time': item.creation_time.isoformat() if item.creation_time else None,
-            'last_modified_time': item.last_modified_time.isoformat() if item.last_modified_time else None,
-            'url': item.url,
-            'directory': item.directory,
-            'children': item.children,
-            'mime_type': item.mime_type,
-            'delta': item.delta,
-            'drive_id': item.drive_id,
-            'visibility': item.visibility
-        }
-        items_dict.append(item_dict)
-    
-    print(f'HubSpot Integration Items: {json.dumps(items_dict, indent=2)}')
-    
-    return list_of_integration_item_metadata
+    return {
+        'items': all_items[:limit],
+        'next_after': json.dumps(next_after_tokens) if any(next_after_tokens.values()) else None,
+        'has_more': any([
+            contacts_result['has_more'],
+            companies_result['has_more'],
+            deals_result['has_more'],
+            len(all_items) > limit
+        ])
+    }
